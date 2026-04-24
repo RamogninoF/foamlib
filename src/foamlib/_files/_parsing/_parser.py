@@ -434,6 +434,10 @@ _UNCOMMENTED_LIST_OF_LISTS_LIKE = re.compile(
     rb"(?:\s*" + _UNCOMMENTED_SUB_LIST_LIKE.pattern + rb")*\s*\)",
     re.ASCII,
 )
+_SUBLIST_CAPTURE = re.compile(
+    rb"(" + _POSSIBLE_INTEGER.pattern + rb")\s*\(([^()]*?)\)",
+    re.ASCII,
+)
 
 
 class _ASCIINumericListListParser(Generic[_DType]):
@@ -471,33 +475,58 @@ class _ASCIINumericListListParser(Generic[_DType]):
         if not match:
             raise ParseError(contents, pos, expected="numeric list of lists")
 
-        data = data.replace(b"(", b" ").replace(b")", b" ")
-        try:
-            data = data.decode("ascii")
-        except UnicodeDecodeError as e:
-            raise ParseError(contents, pos, expected="numeric list of lists") from e
-
         # Resolve to explicit numpy dtype to ensure platform-consistent bit width
         # (Python's `int` maps to int32 on Windows with numpy, but OpenFOAM labels
         # should always be 64-bit when read in ASCII).
         np_dtype: type = np.int64 if self._dtype is int else np.float64
 
-        # Use np.array(data.split()) rather than np.fromstring to:
-        #   - avoid DeprecationWarning from np.fromstring when data contains
-        #     trailing non-numeric content (which we use to detect type mismatch)
-        #   - raise ValueError immediately on any non-parseable token (e.g. a
-        #     float '0.1' when dtype=np.int64), which is caught below as ParseError
-        try:
-            values = np.array(data.split(), dtype=np_dtype)
-        except ValueError as e:
-            raise ParseError(contents, pos, expected="numeric list of lists") from e
-
         ret: list[np.ndarray] = []
-        i = 0
-        while i < len(values):
-            n = int(values[i])
-            ret.append(values[i + 1 : i + n + 1])
-            i += n + 1
+
+        if count is None:
+            # No outer count: validate each sub-list individually so a wrong
+            # inline count (e.g. "2(1 2 3)") is caught immediately.
+            # In practice OpenFOAM only omits the outer count for short lists,
+            # so the per-sublist Python loop is not a performance concern.
+            for m in _SUBLIST_CAPTURE.finditer(data):
+                n = int(m.group(1))
+                if n < 0:
+                    raise ParseError(contents, pos, expected="numeric list of lists")
+                try:
+                    inner = np.array(
+                        m.group(2).decode("ascii").split(), dtype=np_dtype
+                    )
+                except (ValueError, UnicodeDecodeError) as e:
+                    raise ParseError(
+                        contents, pos, expected="numeric list of lists"
+                    ) from e
+                if len(inner) != n:
+                    raise ParseError(contents, pos, expected="numeric list of lists")
+                ret.append(inner)
+        else:
+            # Outer count present: use the fast flat-array approach.
+            # The outer count check below catches any net sublist-count mismatch.
+            # The in-loop guards prevent crashes on negative or truncated counts.
+
+            # Use np.array(data.split()) rather than np.fromstring to:
+            #   - avoid DeprecationWarning from np.fromstring when data contains
+            #     trailing non-numeric content (which we use to detect type mismatch)
+            #   - raise ValueError immediately on any non-parseable token (e.g. a
+            #     float '0.1' when dtype=np.int64), which is caught below as ParseError
+            data_flat = data.replace(b"(", b" ").replace(b")", b" ")
+            try:
+                values = np.array(data_flat.decode("ascii").split(), dtype=np_dtype)
+            except (ValueError, UnicodeDecodeError) as e:
+                raise ParseError(
+                    contents, pos, expected="numeric list of lists"
+                ) from e
+
+            i = 0
+            while i < len(values):
+                n = int(values[i])
+                if n < 0 or i + n + 1 > len(values):
+                    raise ParseError(contents, pos, expected="numeric list of lists")
+                ret.append(values[i + 1 : i + n + 1])
+                i += n + 1
 
         if count is None:
             if not empty_ok and len(ret) == 0:
